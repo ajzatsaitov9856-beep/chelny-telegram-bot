@@ -1,0 +1,52 @@
+name: telegram-autopost
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/10 * * * *"   # каждые 10 минут
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Restore state cache (session + dedup)
+        uses: actions/cache@v4
+        with:
+          path: state
+          key: telegram-state-v1
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Seed session from secret (only if no cached session yet)
+        env:
+          SESSION_FILE_B64: ${{ secrets.SESSION_FILE_B64 }}
+        run: |
+          mkdir -p state
+          if [ ! -f "state/publisher_session.session" ] && [ -n "$SESSION_FILE_B64" ]; then
+            echo "$SESSION_FILE_B64" | base64 -d > state/publisher_session.session
+          fi
+
+      - name: Run
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          DESTINATION: ${{ secrets.DESTINATION }}
+          SOURCES: ${{ secrets.SOURCES }}
+          INTERVAL_SECONDS: "10"
+          DEDUP_DB: "state/dedup.sqlite"
+          SESSION_NAME: "state/publisher_session"
+          START_FROM_NOW: ${{ secrets.START_FROM_NOW }}  # поставь "1" только на первый запуск, потом "0"
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python main.py
