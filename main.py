@@ -1,20 +1,18 @@
 import os
 import re
+import json
 import time
 import asyncio
-import sqlite3
 import hashlib
-import random
-from typing import List, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
+from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, RPCError
 
 load_dotenv()
 
-# ====== ENV ======
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
 SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
@@ -22,442 +20,238 @@ SESSION_STRING = os.getenv("SESSION_STRING", "").strip()
 DESTINATION = os.getenv("DESTINATION", "").strip()
 SOURCES_RAW = os.getenv("SOURCES", "").strip()
 
-INTERVAL_SECONDS = int(os.getenv("INTERVAL_SECONDS", "20"))
-START_FROM_NOW = os.getenv("START_FROM_NOW", "1").strip() == "1"  # 1 = не брать старые
+STATE_FILE = os.getenv("STATE_FILE", "state.json").strip()
+PER_SOURCE_LIMIT = int(os.getenv("PER_SOURCE_LIMIT", "30"))  # сколько сообщений смотреть за запуск на каждый источник
+SLEEP_BETWEEN_SENDS = float(os.getenv("SLEEP_BETWEEN_SENDS", "1.5"))  # пауза между отправками
+MAX_CAPTION = int(os.getenv("MAX_CAPTION", "850"))
 
-DEDUP_DB = os.getenv("DEDUP_DB", "dedup.sqlite").strip()
-DEDUP_TEXT = os.getenv("DEDUP_TEXT", "1").strip() == "1"
-DEDUP_TEXT_TTL_HOURS = int(os.getenv("DEDUP_TEXT_TTL_HOURS", "72"))
-
-MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "1200"))
-MAX_CAPTION_CHARS = int(os.getenv("MAX_CAPTION_CHARS", "900"))
-
-# ВАЖНО: источник обязателен (мы его показываем)
-CREDIT = os.getenv("CREDIT", "1").strip() == "1"  # 1 = добавлять "Источник"
-CREDIT_STYLE = os.getenv("CREDIT_STYLE", "link").strip().lower()  # link | mention | name
-
+# --- аккуратная очистка текста ---
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+_TME_RE = re.compile(r"(?:https?://)?(?:t\.me|telegram\.me)/\S+", re.IGNORECASE)
+_AT_RE = re.compile(r"@\w+")
+_HASH_RE = re.compile(r"#\w+")
+_MULTI_SPACE = re.compile(r"\s{2,}")
+_BAD_LINES_RE = re.compile(r"(подпис|подпиш|реклама|конкурс|розыгрыш|promo|скидк|репост)", re.IGNORECASE)
 
 def parse_sources(s: str) -> List[str]:
     return [x.strip() for x in s.split(",") if x.strip()]
 
-
 SOURCES = parse_sources(SOURCES_RAW)
 
-# ====== DB (антидубликаты) ======
-def db_init() -> None:
-    con = sqlite3.connect(DEDUP_DB)
-    cur = con.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS seen_msg (
-            chat_id INTEGER NOT NULL,
-            msg_id  INTEGER NOT NULL,
-            ts      INTEGER NOT NULL,
-            PRIMARY KEY (chat_id, msg_id)
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS seen_text (
-            h   TEXT PRIMARY KEY,
-            ts  INTEGER NOT NULL
-        )
-    """)
-    con.commit()
-    con.close()
-
-
-def db_seen_msg(chat_id: int, msg_id: int) -> bool:
-    con = sqlite3.connect(DEDUP_DB)
-    cur = con.cursor()
-    cur.execute("SELECT 1 FROM seen_msg WHERE chat_id=? AND msg_id=? LIMIT 1", (chat_id, msg_id))
-    row = cur.fetchone()
-    con.close()
-    return row is not None
-
-
-def db_mark_msgs(pairs: List[Tuple[int, int]]) -> None:
-    if not pairs:
-        return
-    now = int(time.time())
-    con = sqlite3.connect(DEDUP_DB)
-    cur = con.cursor()
-    cur.executemany(
-        "INSERT OR IGNORE INTO seen_msg(chat_id, msg_id, ts) VALUES(?,?,?)",
-        [(c, m, now) for (c, m) in pairs],
-    )
-    con.commit()
-    con.close()
-
-
-def db_cleanup_text_ttl() -> None:
-    if not DEDUP_TEXT:
-        return
-    cutoff = int(time.time()) - DEDUP_TEXT_TTL_HOURS * 3600
-    con = sqlite3.connect(DEDUP_DB)
-    cur = con.cursor()
-    cur.execute("DELETE FROM seen_text WHERE ts < ?", (cutoff,))
-    con.commit()
-    con.close()
-
-
-def db_seen_text(h: str) -> bool:
-    if not DEDUP_TEXT:
-        return False
-    con = sqlite3.connect(DEDUP_DB)
-    cur = con.cursor()
-    cur.execute("SELECT 1 FROM seen_text WHERE h=? LIMIT 1", (h,))
-    row = cur.fetchone()
-    con.close()
-    return row is not None
-
-
-def db_mark_text(h: str) -> None:
-    if not DEDUP_TEXT:
-        return
-    now = int(time.time())
-    con = sqlite3.connect(DEDUP_DB)
-    cur = con.cursor()
-    cur.execute("INSERT OR IGNORE INTO seen_text(h, ts) VALUES(?,?)", (h, now))
-    con.commit()
-    con.close()
-
-
-# ====== REWRITE (офлайн, “обширнее”) ======
-_BAD_LINE_RE = re.compile(r"(подпис|подпиш|репост|реклама|конкурс|розыгрыш|promo|скидк|акци|промокод)", re.IGNORECASE)
-_LINK_RE = re.compile(r"(?:https?://)?(?:t\.me|telegram\.me)/\S+", re.IGNORECASE)
-_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
-_AT_RE = re.compile(r"@\w+")
-_HASH_RE = re.compile(r"#\w+")
-_MULTI_SPACE = re.compile(r"[ \t]{2,}")
-
-
-def cleanup_text(text: str) -> str:
+def clean_text(text: str) -> str:
     t = (text or "").replace("\u200b", "").strip()
+    if not t:
+        return ""
+    t = _TME_RE.sub("", t)
+    t = _URL_RE.sub("", t)
+    t = _AT_RE.sub("", t)
+    t = _HASH_RE.sub("", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     t = _MULTI_SPACE.sub(" ", t)
     return t.strip()
 
-
-def strip_ads_links_mentions(text: str) -> str:
-    t = cleanup_text(text)
-    if not t:
-        return ""
-
-    t = _LINK_RE.sub("", t)
-    t = _URL_RE.sub("", t)
-    t = _AT_RE.sub("", t)
-    t = _HASH_RE.sub("", t)
-
-    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
-    lines = [ln for ln in lines if not _BAD_LINE_RE.search(ln)]
-    t = " ".join(lines)
-
-    t = re.sub(r"\s+([,.!?;:])", r"\1", t)
-    t = re.sub(r"\s{2,}", " ", t)
-    return t.strip()
-
-
 def sentence_split(text: str) -> List[str]:
-    t = cleanup_text(text)
+    t = clean_text(text)
     if not t:
         return []
     parts = re.split(r"(?<=[.!?])\s+", t)
     return [p.strip() for p in parts if len(p.strip()) >= 3]
 
-
 def score_sentence(s: str) -> int:
     score = 0
     if re.search(r"\d", s):
-        score += 4
-    if re.search(r"\b(руб|₽|км|м|час|мин|ул\.|улиц|просп|пр\.|дом|№|район)\b", s, re.IGNORECASE):
         score += 3
-    if re.search(r"\b(сегодня|вчера|завтра|утром|вечером|ночью|сейчас)\b", s, re.IGNORECASE):
+    if re.search(r"\b(руб|₽|км|м|час|мин|ул\.|просп|пр\.|дом|№)\b", s, re.IGNORECASE):
         score += 2
-    if 40 <= len(s) <= 180:
-        score += 2
+    if re.search(r"\b(сегодня|вчера|завтра|утром|вечером|ночью)\b", s, re.IGNORECASE):
+        score += 1
+    if len(s) <= 160:
+        score += 1
     return score
 
-
-def paraphrase_phrases_ru(t: str, rng: random.Random) -> str:
-    # больше замен, чтобы “обширнее”
-    mapping = [
-        ("стало известно", ["появилась информация", "выяснилось", "сообщают"]),
-        ("сообщается", ["по данным на сейчас", "по сообщениям", "по информации"]),
-        ("в настоящее время", ["сейчас", "на данный момент"]),
-        ("на данный момент", ["сейчас", "в данный момент"]),
-        ("по предварительным данным", ["предварительно", "по первичным данным"]),
-        ("в ближайшее время", ["в скором времени", "в ближайшие дни"]),
-        ("проводится проверка", ["идёт проверка", "проверяют обстоятельства"]),
-        ("произошло", ["случилось", "зафиксировали"]),
-        ("обнаружили", ["нашли", "выявили"]),
-        ("в результате", ["в итоге", "по итогу"]),
-        ("власти", ["администрация", "городские службы"]),
-        ("жители", ["горожане", "местные"]),
-        ("обращаются", ["сообщают", "пишут"]),
-        ("из-за", ["по причине", "в связи с"]),
-        ("отмечают", ["говорят", "уточняют"]),
-        ("по словам", ["как заявили", "как сообщили"]),
-        ("напоминаем", ["важно помнить", "на всякий случай"]),
-    ]
-
-    out = t
-    for a, variants in mapping:
-        # случайный вариант замены, но стабильно по rng
-        b = rng.choice(variants)
-        out = re.sub(rf"\b{re.escape(a)}\b", b, out, flags=re.IGNORECASE)
-
-    # мелкие перестановки
-    out = re.sub(r"\bне\s+исключено\b", rng.choice(["возможно", "есть вероятность"]), out, flags=re.IGNORECASE)
-    out = re.sub(r"\bмогут\b", rng.choice(["могут", "вполне могут", "способны"]), out, flags=re.IGNORECASE)
-    return out
-
-
-def build_lead_ru(rng: random.Random) -> str:
-    leads = [
-        "Коротко по ситуации:",
-        "Главное за минуту:",
-        "Что известно сейчас:",
-        "Сводка:",
-        "По фактам:",
-        "Обновление:",
-    ]
-    return rng.choice(leads)
-
-
-def norm_for_hash(text: str) -> str:
-    t = strip_ads_links_mentions(text).lower()
-    t = re.sub(r"\s+", " ", t).strip()
-    t = re.sub(r"[^\w\d]+", "", t)
-    return t
-
-
-def text_hash(text: str) -> str:
-    n = norm_for_hash(text)
-    return hashlib.sha1(n.encode("utf-8")).hexdigest() if n else ""
-
-
-def clamp(text: str, max_len: int) -> str:
-    t = cleanup_text(text)
-    if len(t) <= max_len:
-        return t
-    t = t[:max_len].rsplit(" ", 1)[0].rstrip()
-    return t + "…"
-
-
-def free_rewrite_ru(original: str) -> str:
+def make_summary(text: str) -> str:
     """
-    Более “обширная” бесплатная переработка:
-    - чистим ссылки/@/# и рекламные строки
-    - выбираем 2–4 фактовых предложения
-    - меняем порядок + перефразируем фразы
-    - добавляем лид
+    Без “маскировки”, просто короткое резюме:
+    - чистим ссылки/упоминания/хэштеги
+    - берем 1–3 самых фактовых предложения
     """
-    base = strip_ads_links_mentions(original)
-    if not base:
-        return ""
+    # выкинуть строки-рекламу
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    lines = [ln for ln in lines if not _BAD_LINES_RE.search(ln)]
+    base = " ".join(lines).strip()
 
-    # rng стабильный: один и тот же текст -> одинаковая переработка
-    seed = int(hashlib.md5(base.encode("utf-8")).hexdigest()[:8], 16)
-    rng = random.Random(seed)
-
-    base2 = paraphrase_phrases_ru(base, rng)
-
-    sents = sentence_split(base2)
+    sents = sentence_split(base)
     if not sents:
         return ""
 
     ranked = sorted(sents, key=score_sentence, reverse=True)
-
-    chosen: List[str] = []
+    chosen = []
     seen = set()
+
     for s in ranked:
         key = re.sub(r"\W+", "", s.lower())
         if key in seen:
             continue
         seen.add(key)
         chosen.append(s)
-        if len(chosen) >= 4:
+        if len(chosen) >= 3:
             break
 
-    # переставим порядок: часто “детали” после “главного”
-    if len(chosen) >= 2:
-        # случайно выберем вариант перестановки
-        if rng.random() < 0.7:
-            chosen[0], chosen[1] = chosen[1], chosen[0]
-
-    # лёгкая склейка
     out = " ".join(chosen).strip()
-    out = re.sub(r"\s{2,}", " ", out)
+    if out and not out.lower().startswith("коротко"):
+        out = "Коротко: " + out
+    return out.strip()
 
-    # лид
-    lead = build_lead_ru(rng)
-    if out and not out.lower().startswith(lead.lower()):
-        out = f"{lead} {out}"
+def clamp(text: str, max_len: int) -> str:
+    t = (text or "").strip()
+    if len(t) <= max_len:
+        return t
+    t = t[:max_len].rsplit(" ", 1)[0].rstrip()
+    return t + "…"
 
-    return cleanup_text(out)
+def sha1(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
+def load_state() -> Dict:
+    if not os.path.exists(STATE_FILE):
+        return {"last_ids": {}, "sent_hashes": []}
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data.setdefault("last_ids", {})
+        data.setdefault("sent_hashes", [])
+        return data
+    except Exception:
+        return {"last_ids": {}, "sent_hashes": []}
 
-# ====== SOURCE CREDIT ======
-def build_credit(chat) -> str:
-    if not CREDIT:
-        return ""
+def save_state(state: Dict) -> None:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
 
-    title = getattr(chat, "title", None) or "источник"
-    username = getattr(chat, "username", None)
+async def safe_sleep(seconds: float):
+    if seconds and seconds > 0:
+        await asyncio.sleep(seconds)
 
-    if CREDIT_STYLE == "mention" and username:
-        return f"Источник: @{username}"
-    if CREDIT_STYLE == "link" and username:
-        return f"Источник: https://t.me/{username}"
-    return f"Источник: {title}"
-
-
-# ====== MAIN ======
 async def main():
-    if API_ID <= 0 or not API_HASH:
-        raise RuntimeError("Заполни API_ID и API_HASH")
-    if not SESSION_STRING:
-        raise RuntimeError("Заполни SESSION_STRING")
+    if API_ID <= 0 or not API_HASH or not SESSION_STRING:
+        raise RuntimeError("Нужны API_ID, API_HASH, SESSION_STRING (в Secrets).")
     if not DESTINATION:
-        raise RuntimeError("Заполни DESTINATION (например @my_channel)")
+        raise RuntimeError("Нужен DESTINATION (например @my_channel).")
     if not SOURCES:
-        raise RuntimeError("Заполни SOURCES (например @src1,@src2,...)")
+        raise RuntimeError("Нужен SOURCES (например @src1,@src2).")
 
-    db_init()
-    db_cleanup_text_ttl()
+    state = load_state()
+    sent_hashes = set(state.get("sent_hashes", [])[-500:])  # ограничим память
 
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
-    started_at = int(time.time())
-    send_lock = asyncio.Lock()
+    await client.connect()
+    if not await client.is_user_authorized():
+        raise RuntimeError("SESSION_STRING не авторизован. Пересоздай SESSION_STRING.")
 
-    def is_old(event_ts: int) -> bool:
-        return START_FROM_NOW and (event_ts < started_at)
+    dest = await client.get_entity(DESTINATION)
 
-    async def paced_sleep():
-        if INTERVAL_SECONDS > 0:
-            await asyncio.sleep(INTERVAL_SECONDS)
+    # 1) Первый запуск: ничего НЕ отправляем, просто запоминаем последние id,
+    # чтобы не улетели старые посты.
+    first_run = not state.get("last_ids")
+    if first_run:
+        last_ids = {}
+        for src in SOURCES:
+            ent = await client.get_entity(src)
+            msgs = await client.get_messages(ent, limit=1)
+            last_ids[src] = int(msgs[0].id) if msgs else 0
+        state["last_ids"] = last_ids
+        state["sent_hashes"] = list(sent_hashes)
+        save_state(state)
+        print("✅ Первый запуск: запомнил последние посты. Старое НЕ отправляю. Следующий запуск будет отправлять только новое.")
+        await client.disconnect()
+        return
 
-    @client.on(events.Album(chats=SOURCES))
-    async def on_album(event):
-        msgs = list(event.messages or [])
+    # 2) Обычный запуск: ищем посты новее last_id
+    updated_any = False
+    for src in SOURCES:
+        ent = await client.get_entity(src)
+        last_id = int(state["last_ids"].get(src, 0))
+
+        msgs = await client.get_messages(ent, limit=PER_SOURCE_LIMIT, min_id=last_id)
+        msgs = [m for m in msgs if m and m.id and m.id > last_id]
         if not msgs:
-            return
+            continue
 
-        event_ts = int(event.date.timestamp()) if event.date else int(time.time())
-        if is_old(event_ts):
-            return
+        # сортируем по id, чтобы отправлять по порядку
+        msgs.sort(key=lambda m: m.id)
 
-        pairs = [(m.chat_id, m.id) for m in msgs]
-        if any(db_seen_msg(c, mid) for (c, mid) in pairs):
-            return
+        # группируем альбомы
+        albums: Dict[int, List] = {}
+        singles: List = []
+        for m in msgs:
+            if getattr(m, "grouped_id", None):
+                albums.setdefault(m.grouped_id, []).append(m)
+            else:
+                singles.append(m)
 
-        chat = await event.get_chat()
-        credit = build_credit(chat)
+        items: List[Tuple[int, str, List]] = []
+        for gid, group in albums.items():
+            group.sort(key=lambda m: m.id)
+            items.append((group[0].id, "album", group))
+        for m in singles:
+            items.append((m.id, "single", [m]))
+        items.sort(key=lambda x: x[0])
 
-        caption_src = (msgs[0].raw_text or "")
-        caption_new = free_rewrite_ru(caption_src)
-        if credit:
-            caption_new = (caption_new + "\n\n" + credit).strip() if caption_new else credit
-        caption_new = clamp(caption_new, MAX_CAPTION_CHARS)
+        max_sent_id = last_id
 
-        # антидубль по смыслу
-        if DEDUP_TEXT and caption_src.strip():
-            h = text_hash(caption_src)
-            if h and db_seen_text(h):
-                db_mark_msgs(pairs)
-                return
+        for first_id, kind, pack in items:
+            # текст берём с первого сообщения
+            src_text = (pack[0].raw_text or "").strip()
+            summary = clamp(make_summary(src_text), MAX_CAPTION)
 
-        try:
-            async with send_lock:
-                media_msgs = [m for m in msgs if getattr(m, "media", None)]
-                if not media_msgs:
-                    return
+            # честный источник (минимально)
+            src_name = getattr(ent, "title", None) or src
+            caption = summary
+            if caption:
+                caption = f"{caption}\n\nИсточник: {src_name}"
+            else:
+                caption = f"Источник: {src_name}"
 
-                # Перепубликация: медиа сохраняется, текст меняем
-                await client.send_file(
-                    DESTINATION,
-                    files=media_msgs,
-                    caption=caption_new if caption_new else None
-                )
+            # антидубль (по резюме)
+            h = sha1(caption.lower())
+            if h in sent_hashes:
+                max_sent_id = max(max_sent_id, max(m.id for m in pack))
+                continue
 
-                db_mark_msgs(pairs)
-                if DEDUP_TEXT and caption_src.strip():
-                    h = text_hash(caption_src)
-                    if h:
-                        db_mark_text(h)
-
-                await paced_sleep()
-
-        except FloodWaitError as e:
-            await asyncio.sleep(int(getattr(e, "seconds", 60)))
-        except Exception as e:
-            print("Ошибка альбома:", e)
-
-    @client.on(events.NewMessage(chats=SOURCES))
-    async def on_message(event):
-        if event.out:
-            return
-        if getattr(event.message, "grouped_id", None):
-            return  # альбом обработает on_album
-
-        event_ts = int(event.date.timestamp()) if event.date else int(time.time())
-        if is_old(event_ts):
-            return
-
-        chat_id = event.chat_id
-        msg_id = event.id
-
-        if db_seen_msg(chat_id, msg_id):
-            return
-
-        chat = await event.get_chat()
-        credit = build_credit(chat)
-
-        original_text = event.raw_text or ""
-        new_text = free_rewrite_ru(original_text)
-        if credit:
-            new_text = (new_text + "\n\n" + credit).strip() if new_text else credit
-        new_text = clamp(new_text, MAX_TEXT_CHARS)
-
-        # антидубль по смыслу
-        if DEDUP_TEXT and original_text.strip():
-            h = text_hash(original_text)
-            if h and db_seen_text(h):
-                db_mark_msgs([(chat_id, msg_id)])
-                return
-
-        try:
-            async with send_lock:
-                if getattr(event.message, "media", None):
-                    await client.send_file(
-                        DESTINATION,
-                        file=event.message,
-                        caption=new_text if new_text else None
-                    )
+            try:
+                has_media = any(getattr(m, "media", None) for m in pack)
+                if has_media:
+                    files = [m for m in pack if getattr(m, "media", None)]
+                    await client.send_file(dest, file=files, caption=caption)
                 else:
-                    if not new_text:
-                        db_mark_msgs([(chat_id, msg_id)])
-                        return
-                    await client.send_message(DESTINATION, new_text)
+                    await client.send_message(dest, caption, link_preview=False)
 
-                db_mark_msgs([(chat_id, msg_id)])
-                if DEDUP_TEXT and original_text.strip():
-                    h = text_hash(original_text)
-                    if h:
-                        db_mark_text(h)
+                sent_hashes.add(h)
+                max_sent_id = max(max_sent_id, max(m.id for m in pack))
+                updated_any = True
 
-                await paced_sleep()
+                await safe_sleep(SLEEP_BETWEEN_SENDS)
 
-        except FloodWaitError as e:
-            await asyncio.sleep(int(getattr(e, "seconds", 60)))
-        except Exception as e:
-            print("Ошибка сообщения:", e)
+            except FloodWaitError as e:
+                await asyncio.sleep(int(getattr(e, "seconds", 30)))
+            except RPCError as e:
+                print("RPCError:", e)
+            except Exception as e:
+                print("Ошибка отправки:", e)
 
-    print("✅ Запуск. Ждём новые посты…")
-    await client.start()
-    await client.run_until_disconnected()
+        state["last_ids"][src] = int(max_sent_id)
 
+    # сохраняем state
+    state["sent_hashes"] = list(sent_hashes)[-500:]
+    save_state(state)
+
+    if updated_any:
+        print("✅ Отправил новое и обновил state.json")
+    else:
+        print("✅ Новых постов нет (state.json проверен/обновлён)")
+
+    await client.disconnect()
 
 if __name__ == "__main__":
     asyncio.run(main())
-
