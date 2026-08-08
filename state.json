@@ -1,7 +1,7 @@
 {
   "last_id": {
     "@chelnylife": 57215,
-    "@chelny_chs": 21472,
+    "@chelny_chs": 21481,
     "@naberezhnye_chelny8": 1995
   },
   "seen_text": {
@@ -139,6 +139,8 @@
     "34ed6a43ae141cda82236cd848a3c5e681ec986e": 1786118549,
     "fe2b406c6bad2bc49f9e431db79b52c959525646": 1786119846,
     "8f9e70fd200747b103208540469693687b315f8c": 1786121900,
-    "53b1bd053b4fe7fd99155bb1ed9bd8630ff4b911": 1786124129
+    "53b1bd053b4fe7fd99155bb1ed9bd8630ff4b911": 1786124129,
+    "eec6d409051b24f3277a83faa5aa94a3605f4acd": 1786128052,
+    "07e6f28eff39e3d5e4a696187f2656ee2cb9b680": 1786128063
   }
 }
